@@ -1,0 +1,143 @@
+--- a/switch_to_lineage.sh
++++ b/switch_to_lineage.sh
+@@ -20,6 +20,15 @@
+ 
+ BACKUP_DIR="/data/local/tmp/lineage_backups"
+ 
++# Data-isolation insurance (patched): record the exact ownership and modes of
++# /data/media before anything touches it, so return_to_oneui.sh can restore
++# them byte-exactly on the plain-bind fallback path. Cheap no-op when the
++# overlayfs path is in use.
++if [ ! -f /data/local/tmp/media_perms_snapshot.tsv ]; then
++    /system/bin/sh "$STAGE/snapshot_media_perms.sh" 2>/dev/null || \
++        echo "WARNING: /data/media permission snapshot failed"
++fi
++
+ echo "=== LINEAGEOS 23.2 TAKEOVER STARTING ==="
+ 
+ # Put SELinux in permissive mode for the duration of the takeover. The guest
+--- a/master_prepare.sh
++++ b/master_prepare.sh
+@@ -75,7 +75,14 @@
+     mkdir -p "$ROOTFS/system_ext/apex"
+     mount | grep -q "$ROOTFS/system_ext/apex " || $BB mount --bind /system_ext/apex "$ROOTFS/system_ext/apex"
+ fi
+-mount | grep -q "$ROOTFS/mnt " || $BB mount --rbind /mnt "$ROOTFS/mnt"
++# Isolation (patched): upstream recursive-bound the host's /mnt into the
++# rootfs, exposing FUSE passthrough and vendor mounts to the guest. The guest
++# only needs emulated storage, which master_inner.sh rebuilds from the
++# isolated /data/media view, so a private tmpfs replaces the bind.
++if ! mount | grep -q "$ROOTFS/mnt "; then
++    $BB mount -t tmpfs tmpfs "$ROOTFS/mnt"
++    mkdir -p "$ROOTFS/mnt/user/0"
++fi
+ if [ -f "$STAGE/services_patched.jar" ]; then
+     $BB umount -l "$ROOTFS/system/framework/services.jar" 2>/dev/null || true
+     $BB mount --bind "$STAGE/services_patched.jar" "$ROOTFS/system/framework/services.jar"
+@@ -262,8 +269,25 @@
+ mount | grep -q "$ROOTFS/data " || $BB mount --bind "$STAGE/data" "$ROOTFS/data"
+ mount | grep -q "$ROOTFS/data/adb " || $BB mount --bind /data/adb "$ROOTFS/data/adb"
+ mount | grep -q "$ROOTFS/data/apex " || $BB mount --bind /data/apex "$ROOTFS/data/apex"
++# Isolation (patched): upstream plain-bound the host's real /data/media into
++# the rootfs, and master_inner.sh then chown -R'ed / chmod -R 777'ed it - the
++# real shared-file tree, all of it. With the overlay the guest reads the host
++# files but every write or mode change lands in the private upper; the host
++# tree is never modified. Upper files stay unencrypted-at-rest until the
++# return script exports or deletes them; snapshot_media_perms.sh runs first
++# so the plain-bind fallback is still reversible.
++mkdir -p "$STAGE/media-overlay/upper" "$STAGE/media-overlay/work"
+ mkdir -p "$ROOTFS/data/media"
+-mount | grep -q "$ROOTFS/data/media " || $BB mount --bind /data/media "$ROOTFS/data/media" 2>/dev/null || true
++if ! mount | grep -q "$ROOTFS/data/media "; then
++    if $BB mount -t overlay overlay \
++        -o "lowerdir=/data/media,upperdir=$STAGE/media-overlay/upper,workdir=$STAGE/media-overlay/work" \
++        "$ROOTFS/data/media" 2>/dev/null; then
++        echo "Isolated /data/media overlay mounted (upper: $STAGE/media-overlay/upper)"
++    else
++        echo "WARNING: overlayfs failed - plain bind, perms snapshot required"
++        $BB mount --bind /data/media "$ROOTFS/data/media" 2>/dev/null || true
++    fi
++fi
+ 
+ echo "=== 5e. Writing per-package data-dir helper ==="
+ # Apps installed before the /data bridge existed have no CE/DE data dirs in the
+--- a/master_inner.sh
++++ b/master_inner.sh
+@@ -29,9 +29,12 @@
+ $BB mount --bind /data/misc/profiles/ref /data_mirror/ref_profiles 2>/dev/null || true
+ 
+ echo "[Pivoted Root] Setting up /data/media and emulated storage..."
++# (patched) upstream chown -R 1023:1023 / chmod -R 777 here rewrote the real
++# host /data/media on every takeover and was not reversible. Under the
++# isolation overlay these lines only touch the private upper, and
++# ensure_app_storage.sh already creates the per-app and skeleton dirs with
++# sane ownership - so the recursive rewrite is simply gone.
+ mkdir -p /data/media/0/Android /data/media/0/Pictures/Screenshots /data/media/0/Download /data/media/0/DCIM /data/media/0/Documents
+-chown -R 1023:1023 /data/media 2>/dev/null || true
+-chmod -R 777 /data/media 2>/dev/null || true
+ $BB mount -t tmpfs tmpfs /storage 2>/dev/null || true
+ mkdir -p /storage/emulated/0
+ $BB mount --bind /data/media/0 /storage/emulated/0 2>/dev/null || true
+--- a/return_to_oneui.sh
++++ b/return_to_oneui.sh
+@@ -1,6 +1,9 @@
+ #!/system/bin/sh
+ # Return to One UI / Safe State Restoration
+ BACKUP_DIR="/data/local/tmp/lineage_backups"
++STAGE="/data/local/tmp/lineage_stage"
++RP=$(which resetprop 2>/dev/null || echo "/data/adb/ksu/bin/resetprop")
++[ -x "$RP" ] || RP=$(find /data/adb /system -name resetprop 2>/dev/null | head -n 1)
+ 
+ echo "=== [1/5] Terminating Container Supervision & Zygote ==="
+ pkill -9 -f "ctl.stop zygote" 2>/dev/null || true
+@@ -57,6 +60,50 @@
+ mkdir -p /storage/emulated/0
+ mount --bind /data/media/0 /storage/emulated/0 2>/dev/null || true
+ 
++echo "=== [4b/5] Restoring Isolation Overlay and Host State ==="
++# Detach the /data/media isolation overlay so the real directory is served
++# again; the while-loop below removes any remaining rootfs mounts.
++umount -l /data/local/tmp/lineage_stage/rootfs/data/media 2>/dev/null || true
++# switch_to_lineage.sh set this persistently; the stock firmware does not
++# define it, so delete rather than set false.
++if [ -x "$RP" ]; then
++    "$RP" --delete persist.sys.disable_rescue 2>/dev/null || true
++fi
++setprop persist.sys.disable_rescue false 2>/dev/null || true
++echo "persist.sys.disable_rescue now: '$(getprop persist.sys.disable_rescue)'"
++# Temporary guest audio props: remove so One UI reloads its defaults.
++if [ -x "$RP" ]; then
++    "$RP" --delete audio.offload.disable audio.deep_buffer.media audio.offload.video vendor.audio.offload.track.enable 2>/dev/null || true
++fi
++# The takeover chmod'ed the dnsproxyd socket to 666 for the guest.
++chown root:inet /dev/socket/dnsproxyd 2>/dev/null || true
++chmod 660 /dev/socket/dnsproxyd 2>/dev/null || true
++# net_fix.sh installed a catch-all ip rule at priority 14999 and private
++# table 4242 (and deleted the rule at 31999). Remove ours, flush the table
++# and restart netd so One UI's rules and the BPF configuration map rebuild
++# from the live network state.
++ip rule del priority 14999 2>/dev/null || true
++ip route flush table 4242 2>/dev/null || true
++setprop ctl.restart netd 2>/dev/null || true
++# Plain-bind fallback only: put back the exact ownership and modes recorded
++# by snapshot_media_perms.sh before the takeover.
++for snap in /data/local/tmp/media_perms_snapshot.tsv \
++            /data/local/tmp/lineage_stage/media_perms_snapshot.tsv; do
++    if [ -f "$snap" ]; then
++        /system/bin/sh /data/local/tmp/restore_media_perms.sh "$snap" || true
++        break
++    fi
++done
++# Guest-session files live in the overlay upper; they do not exist on the
++# host until exported. Copy new files out (no ownership or mode changes on
++# existing host files) when the export flag is set.
++UPPER=/data/local/tmp/lineage_stage/media-overlay/upper
++if [ -d "$UPPER" ] && [ -f "$STAGE/export_upper.flag" ]; then
++    echo "Exporting guest-session files from the isolation upper..."
++    cp -a "$UPPER"/. /data/media/ 2>/dev/null || true
++    echo "Export done (ownership copied as media-namespace values; review /data/media)"
++fi
++
+ echo "=== [5/5] Starting One UI Display & Host Services ==="
+ setprop ctl.start surfaceflinger
+ setprop ctl.start zygote

@@ -1,0 +1,89 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+index 89a15bb..fc3858a 100644
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -4,12 +4,12 @@ plugins {
+ 
+ android {
+     namespace = "df.root"
+-    compileSdk = 37
++    compileSdk = 36
+ 
+     defaultConfig {
+         applicationId = "df.root"
+         minSdk = 32
+-        targetSdk = 37
++        targetSdk = 36
+         versionCode = 33
+         versionName = "1.16"
+ 
+diff --git a/app/src/main/java/df/root/ExploitRunner.java b/app/src/main/java/df/root/ExploitRunner.java
+index f8342d6..7a3378b 100644
+--- a/app/src/main/java/df/root/ExploitRunner.java
++++ b/app/src/main/java/df/root/ExploitRunner.java
+@@ -105,10 +105,41 @@ public class ExploitRunner {
+         if (!src.exists()) throw new IOException(src + " not found");
+         File dest = new File(ctx.getFilesDir().getParentFile(), name);
+         Files.copy(src.toPath(), dest.toPath(), StandardCopyOption.REPLACE_EXISTING);
++        if ("ksud".equals(name)) {
++            patchKsudLabels(dest);
++        }
+         if (!dest.setExecutable(true, false))
+             throw new IOException("setExecutable failed: " + dest.getAbsolutePath());
+     }
+ 
++    /**
++     * Samsung's SEPF policy does not define the "ksu_file" type, so ksud's
++     * installer dies at "Failed to change SELinux context for /data/adb/ksud"
++     * (lsetxattr returns EINVAL for an undefined type) and the daemon never
++     * starts. Relabel to a type that exists in this policy, same byte length,
++     * so the installer completes. Both contexts are 22 bytes ASCII.
++     */
++    private static void patchKsudLabels(File ksud) throws Exception {
++        final byte[] from = "u:object_r:ksu_file:s0".getBytes("UTF-8");
++        final byte[] to   = "u:object_r:installd:s0".getBytes("UTF-8");
++        byte[] data = Files.readAllBytes(ksud.toPath());
++        int replaced = 0;
++        for (int i = 0; i + from.length <= data.length; i++) {
++            boolean hit = true;
++            for (int j = 0; j < from.length; j++) {
++                if (data[i + j] != from[j]) { hit = false; break; }
++            }
++            if (hit) {
++                System.arraycopy(to, 0, data, i, to.length);
++                replaced++;
++                i += to.length - 1;
++            }
++        }
++        if (replaced > 0) {
++            Files.write(ksud.toPath(), data);
++        }
++    }
++
+     private static void stageAssets(Context ctx, String suManagerPackage) throws Exception {
+         var app = ctx.getPackageManager().getApplicationInfo(suManagerPackage, 0);
+         stageBin(ctx, new File(app.nativeLibraryDir, "libksud.so"), "ksud");
+diff --git a/app/src/main/jni/bootstrap.c b/app/src/main/jni/bootstrap.c
+index 9f379bc..6a881f9 100644
+--- a/app/src/main/jni/bootstrap.c
++++ b/app/src/main/jni/bootstrap.c
+@@ -233,7 +233,18 @@ int main(void)
+             write(fd, ctx, strlen(ctx));
+             close(fd);
+         }
+-        if (run_ctx(NULL, (char *[]){ KSUD_STAGE, "late-load", "--package-name", su_manager, NULL }) == 0) {
++        // First pass: load kernelsu.ko - the driver becomes available from
++        // here on. The install stage may fail on this pass while the policy
++        // lacks the KSU relabel rules; that is expected and handled below.
++        run_ctx(NULL, (char *[]){ KSUD_STAGE, "late-load", "--allow-shell", "--package-name", su_manager, NULL });
++        // Driver is up: make the ksu domain permissive so Samsung's enforcing
++        // policy cannot block the installer's relabel of /data/adb/ksud
++        // (the SEPF policy neither defines ksu_file nor allows relabeling to
++        // our substituted type from an enforcing domain).
++        run_ctx(NULL, (char *[]){ KSUD_STAGE, "sepolicy", "patch", "permissive ksu", NULL });
++        // Second pass: the ko is already present, so this one completes the
++        // install and starts the daemon.
++        if (run_ctx(NULL, (char *[]){ KSUD_STAGE, "late-load", "--allow-shell", "--package-name", su_manager, NULL }) == 0) {
+             touch("/dev/dfm6");
+             if (soft_reboot) {
+                 while (late_load_running()) sleep(1);

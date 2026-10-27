@@ -1,0 +1,11 @@
+/work/
+/downloads/
+__pycache__/
+
+# local session automation, never publish
+monitor_*.log
+zcode_monitor*
+send_continuation.py
+send_continue_message.sh
+README_monitor.md
+local.properties
