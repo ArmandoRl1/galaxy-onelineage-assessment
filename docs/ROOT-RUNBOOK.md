@@ -28,7 +28,13 @@ rebooted clean).
    module param grant shell directly; the ksud userspace daemon is not
    required (its installer is still policy-limited; see
    `patches/dirtyfrag/README.md`).
-4. Panic button at any point: reboot returns the phone to clean stock One UI.
+4. Wireless debugging works identically: pair once (Settings → Developer
+   options → Wireless debugging → pairing code), then `adb pair ip:port
+   <code>` and `adb connect`. `su` over the TLS transport returns the same
+   uid 0, including write access. Security note: any paired adb client gets
+   root over the network until the phone reboots (the listener, the pairing
+   grant and the root module all clear together).
+5. Panic button at any point: reboot returns the phone to clean stock One UI.
 
 ## Why this path
 
